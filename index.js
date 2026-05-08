@@ -16,6 +16,7 @@ const KNOWN_TABS_KEY = "known-tabs:v1";
 const RENDERER_STATE_KEY = "__codexppConversationTabsState";
 const RENDERER_STATES_KEY = "__codexppConversationTabsStates";
 const RENDERER_GENERATION_KEY = "__codexppConversationTabsGeneration";
+const PENDING_NEW_CHAT_TTL_MS = 120000;
 
 /** @type {import("@codex-plusplus/sdk").Tweak} */
 module.exports = {
@@ -57,6 +58,7 @@ function startRenderer(self, api) {
     observer: null,
     routePoll: null,
     activationSeq: 0,
+    pendingNewChat: null,
     generation: nextRendererGeneration(),
     draggedTabId: null,
     dragDropTargetId: null,
@@ -64,6 +66,7 @@ function startRenderer(self, api) {
     dragSuppressClick: false,
     onKeyDown: null,
     onDocumentPointerDown: null,
+    onNewChatIntent: null,
     onRouteChange: null,
     onResize: null,
     onTabShortcut: null,
@@ -88,15 +91,16 @@ function startRenderer(self, api) {
     if (closeCurrentTab(state)) event.preventDefault();
   };
   state.onDocumentPointerDown = (event) => {
-    if (!state.menu) return;
-    const target = event.target;
-    if (target instanceof Node && state.menu.contains(target)) return;
-    closeMenu(state);
+    handleDocumentPointerDown(state, event);
+  };
+  state.onNewChatIntent = (event) => {
+    beginPendingNewChat(state, event?.detail?.source || "shortcut");
   };
   state.onRouteChange = () => handleRouteChange(state);
 
   document.addEventListener("keydown", state.onKeyDown, true);
   document.addEventListener("pointerdown", state.onDocumentPointerDown, true);
+  window.addEventListener("codexpp-conversation-tab-new-chat-intent", state.onNewChatIntent);
   window.addEventListener("codexpp-conversation-tab-shortcut", state.onTabShortcut);
   window.addEventListener("codexpp-conversation-tab-close-current", state.onCloseCurrentTabShortcut);
   window.addEventListener("popstate", state.onRouteChange);
@@ -118,6 +122,7 @@ function startRenderer(self, api) {
     );
     const changedThreadTitle = externalMutations.some(isThreadTitleMutation);
     if (changedLayout || changedActiveThread || changedThreadTitle) {
+      if (changedThreadTitle) syncHeaderIntegration(state);
       scheduleRefresh(state, changedActiveThread ? 40 : 80);
     }
   });
@@ -147,6 +152,7 @@ function disposeRendererState(state) {
   document.removeEventListener("pointerdown", state.onDocumentPointerDown, true);
   window.removeEventListener("codexpp-conversation-tab-shortcut", state.onTabShortcut);
   window.removeEventListener("codexpp-conversation-tab-close-current", state.onCloseCurrentTabShortcut);
+  window.removeEventListener("codexpp-conversation-tab-new-chat-intent", state.onNewChatIntent);
   window.removeEventListener("popstate", state.onRouteChange);
   window.removeEventListener("hashchange", state.onRouteChange);
   window.removeEventListener("resize", state.onResize);
@@ -953,13 +959,17 @@ function hideNativeHeaderTitle(state) {
   const candidates = Array.from(header.querySelectorAll("span, div"))
     .filter((node) => node instanceof HTMLElement)
     .filter((node) => !state.root?.contains(node))
+    .filter((node) => !node.querySelector("[data-codexpp-native-chat-actions-button='true'], button, [role='button'], a"))
     .filter((node) => !node.closest("button, [role='button'], a"))
     .filter((node) => titles.has(normalizeIndicatorText(node.textContent)))
     .map((node) => ({ node, rect: node.getBoundingClientRect() }))
     .filter(({ rect }) => rect.width > 1 && rect.height > 1 && rect.width <= 520 && rect.height <= 32)
     .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
   for (const { node } of candidates) {
-    node.setAttribute("data-codexpp-native-title-hidden", "true");
+    const region = nativeHeaderTitleRegion(node, header);
+    if (state.root?.contains(region) || region.contains(state.root)) continue;
+    if (region.querySelector("[data-codexpp-native-chat-actions-button='true'], button, [role='button'], a")) continue;
+    region.setAttribute("data-codexpp-native-title-hidden", "true");
   }
 }
 
@@ -971,6 +981,7 @@ function nativeHeaderTitlesToHide(state) {
   };
 
   add(currentTitleForHeader(state));
+  add(currentNativeHeaderTitle(state));
   add(titleFromSidebarRow(document.querySelector("[data-app-action-sidebar-thread-active='true'][data-app-action-sidebar-thread-title]")));
   for (const item of state.tabs) add(item.title);
   for (const node of state.root?.querySelectorAll("[data-codexpp-conversation-tab-title='true']") || []) {
@@ -1016,11 +1027,12 @@ function titleFromSidebarRow(row) {
 
 function nativeHeaderTitleRegion(leaf, header) {
   let node = leaf;
+  const leafRect = leaf.getBoundingClientRect();
   while (node.parentElement && node.parentElement !== header) {
     const parent = node.parentElement;
     const rect = parent.getBoundingClientRect();
-    if (parent.querySelector("button, [role='button']") && rect.height >= 24) return parent;
-    if (rect.height >= 36 && rect.width > leaf.getBoundingClientRect().width + 24) return parent;
+    if (parent.querySelector("[data-codexpp-native-chat-actions-button='true'], button, [role='button'], a")) break;
+    if (rect.height >= 36 && rect.width > leafRect.width + 24) return parent;
     node = parent;
   }
   return leaf;
@@ -1045,11 +1057,17 @@ async function refreshTabs(state) {
     const sidebarChats = readSidebarChats();
     for (const item of sidebarChats) rememberKnownTab(state, item);
 
-    const currentId = getCurrentChatId();
+    expirePendingNewChat(state);
+    const currentId = getCurrentChatIdForState(state);
     if (currentId) {
       state.currentChatId = currentId;
       state.closedIds.delete(currentId);
-      rememberOpenId(state, currentId);
+      if (!claimPendingNewChat(state, currentId)) {
+        clearPendingNewChat(state);
+        rememberOpenId(state, currentId);
+      }
+    } else if (state.pendingNewChat) {
+      state.currentChatId = null;
     }
 
     let recent = [];
@@ -1061,6 +1079,9 @@ async function refreshTabs(state) {
     if (!Array.isArray(recent)) recent = [];
 
     for (const item of recent) rememberKnownTab(state, item);
+    if (!state.currentChatId && state.pendingNewChat) {
+      claimPendingRecentChat(state, recent);
+    }
 
     const recentById = new Map(recent.map((item) => [item.id, item]));
     const sidebarById = new Map(
@@ -1118,6 +1139,8 @@ async function refreshTabs(state) {
     syncHeaderIntegration(state);
   } finally {
     state.refreshing = false;
+    expirePendingNewChat(state);
+    if (state.pendingNewChat) scheduleRefresh(state, 500);
   }
 }
 
@@ -1483,6 +1506,23 @@ function closeTabHoverTooltip() {
   document.querySelector("[data-codexpp-tab-hover-tooltip='true']")?.remove();
 }
 
+function handleDocumentPointerDown(state, event) {
+  const target = event.target;
+  const element = target instanceof Element ? target : null;
+
+  if (element?.closest("[data-codexpp-conversation-tab='true']")) {
+    clearPendingNewChat(state);
+  } else if (element?.closest("[data-app-action-sidebar-thread-row]")) {
+    clearPendingNewChat(state);
+  } else if (isNewChatTriggerElement(element)) {
+    beginPendingNewChat(state, "button");
+  }
+
+  if (!state.menu) return;
+  if (target instanceof Node && state.menu.contains(target)) return;
+  closeMenu(state);
+}
+
 function handleGlobalKeyDown(state, event) {
   if (event.key === "Escape") {
     closeMenu(state);
@@ -1492,6 +1532,11 @@ function handleGlobalKeyDown(state, event) {
   if (isCloseCurrentTabShortcut(event) && closeCurrentTab(state)) {
     event.preventDefault();
     event.stopPropagation();
+    return;
+  }
+
+  if (isNewChatShortcut(event)) {
+    beginPendingNewChat(state, "keyboard");
     return;
   }
 
@@ -1555,9 +1600,16 @@ function isCloseCurrentTabShortcut(event) {
   return String(event.key || "").toLowerCase() === "w" || event.code === "KeyW";
 }
 
+function isNewChatShortcut(event) {
+  if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return false;
+  if (event.repeat) return false;
+  return String(event.key || "").toLowerCase() === "n" || event.code === "KeyN";
+}
+
 async function activateTab(state, id) {
   if (!isActiveRendererState(state)) return;
   if (!id || id === state.currentChatId) return;
+  clearPendingNewChat(state);
   const activationSeq = ++state.activationSeq;
   const previousId = state.currentChatId;
   rememberOpenId(state, id);
@@ -1569,7 +1621,7 @@ async function activateTab(state, id) {
   const started = await navigateToChat(state, id);
   const activated = await waitForActiveChatId(id, started ? 1800 : 500, () => activationSeq !== state.activationSeq);
   if (activationSeq !== state.activationSeq) return;
-  if (activated) {
+  if (activated || started) {
     state.currentChatId = id;
   } else {
     state.currentChatId = getCurrentChatId() || previousId;
@@ -1967,14 +2019,22 @@ function findOpenMiniWindowItem() {
 function handleRouteChange(state) {
   if (!isActiveRendererState(state)) return;
   const nextUrl = window.location.href;
-  const nextId = getCurrentChatId();
+  expirePendingNewChat(state);
+  const nextId = getCurrentChatIdForState(state);
   if (nextUrl === state.lastUrl && nextId === state.currentChatId) return;
   state.lastUrl = nextUrl;
   if (nextId) {
     state.currentChatId = nextId;
     state.closedIds.delete(nextId);
-    rememberOpenId(state, nextId);
+    if (!claimPendingNewChat(state, nextId)) {
+      clearPendingNewChat(state);
+      rememberOpenId(state, nextId);
+    }
     persistState(state);
+  } else if (state.pendingNewChat) {
+    state.currentChatId = null;
+    renderTabs(state);
+    syncHeaderIntegration(state);
   }
   if (state.root) syncTabBarVisibility(state);
   scheduleRefresh(state, 80);
@@ -2018,7 +2078,127 @@ async function navigateToChat(state, id) {
   return false;
 }
 
+function beginPendingNewChat(state, source = "unknown") {
+  if (!isActiveRendererState(state)) return;
+  if (state.pendingNewChat && Date.now() - state.pendingNewChat.startedAt < 1000) return;
+  const afterId = state.currentChatId || selectedRenderedTabId(state) || null;
+  state.pendingNewChat = {
+    source,
+    afterId,
+    startedAt: Date.now(),
+    knownIds: knownConversationIds(state),
+  };
+  state.activationSeq += 1;
+  state.currentChatId = null;
+  closeMenu(state);
+  closeTabHoverTooltip();
+  clearNativeHeaderTitleHiding();
+  clearNativeChatActionsButton(state);
+  renderTabs(state);
+  syncHeaderIntegration(state);
+  scheduleRefresh(state, 80);
+}
+
+function clearPendingNewChat(state) {
+  if (state) state.pendingNewChat = null;
+}
+
+function expirePendingNewChat(state) {
+  if (!state?.pendingNewChat) return;
+  if (Date.now() - state.pendingNewChat.startedAt > PENDING_NEW_CHAT_TTL_MS) {
+    state.pendingNewChat = null;
+  }
+}
+
+function knownConversationIds(state) {
+  const ids = new Set([
+    ...state.openIds,
+    ...state.tabs.map((tab) => tab.id).filter(Boolean),
+    ...Object.keys(state.knownTabs || {}),
+  ]);
+  for (const item of readSidebarChats()) {
+    if (item.id) ids.add(item.id);
+  }
+  return ids;
+}
+
+function selectedRenderedTabId(state) {
+  const selected = state.list?.querySelector("[data-codexpp-conversation-tab='true'][aria-selected='true']");
+  return selected instanceof HTMLElement ? selected.getAttribute("data-tab-id") : null;
+}
+
+function getCurrentChatIdForState(state) {
+  const routeId = currentChatIdFromRoute();
+  if (routeId) return routeId;
+
+  const sidebarId = currentChatIdFromSidebarActive();
+  if (sidebarId && pendingAllowsCurrentId(state, sidebarId)) return sidebarId;
+
+  if (state?.pendingNewChat) return null;
+  return currentChatIdFromActiveLink() || currentChatIdFromHeaderTitle(state);
+}
+
+function pendingAllowsCurrentId(state, id) {
+  const pending = state?.pendingNewChat;
+  if (!pending || !id) return true;
+  return !pending.knownIds?.has(id);
+}
+
+function claimPendingNewChat(state, id) {
+  const pending = state?.pendingNewChat;
+  if (!pending || !id || !pendingAllowsCurrentId(state, id)) return false;
+
+  insertOpenIdAfter(state, id, pending.afterId);
+  if (!state.knownTabs[id]) {
+    rememberKnownTab(state, {
+      id,
+      title: currentLiveSidebarTitle(state) || "New chat",
+      updatedAt: null,
+      cwdBasename: null,
+      projectName: null,
+      isRunning: false,
+    });
+  }
+  state.pendingNewChat = null;
+  return true;
+}
+
+function claimPendingRecentChat(state, recent) {
+  const pending = state?.pendingNewChat;
+  if (!pending || !Array.isArray(recent)) return false;
+
+  const item = recent.find((candidate) =>
+    candidate?.id &&
+    pendingAllowsCurrentId(state, candidate.id) &&
+    recentChatBelongsToPendingNewChat(pending, candidate)
+  );
+  if (!item) return false;
+
+  state.currentChatId = item.id;
+  state.closedIds.delete(item.id);
+  insertOpenIdAfter(state, item.id, pending.afterId);
+  rememberKnownTab(state, item);
+  state.pendingNewChat = null;
+  return true;
+}
+
+function recentChatBelongsToPendingNewChat(pending, item) {
+  if (!item?.updatedAt) return true;
+  const updatedAt = Date.parse(item.updatedAt);
+  if (!Number.isFinite(updatedAt)) return true;
+  return updatedAt >= pending.startedAt - 30000;
+}
+
+function insertOpenIdAfter(state, id, afterId) {
+  state.openIds = state.openIds.filter((candidate) => candidate !== id);
+  const index = afterId ? state.openIds.indexOf(afterId) : -1;
+  const insertAt = index >= 0 ? index + 1 : state.openIds.length;
+  state.openIds.splice(insertAt, 0, id);
+  trimOpenIds(state, id);
+}
+
 async function navigateToNewChat(state) {
+  beginPendingNewChat(state, "internal");
   clearNativeHeaderTitleHiding();
   clearNativeChatActionsButton(state);
   closeTabHoverTooltip();
@@ -2046,11 +2226,42 @@ function findNewChatButton() {
       !node.closest("[data-codexpp-conversation-tabs-menu='true']")
     );
 
-  return candidates.find((node) => {
-    const label = normalizeIndicatorText(node.getAttribute("aria-label") || "");
-    const text = normalizeIndicatorText(node.textContent || "").replace(/\s+/g, "");
-    return label === "new chat" || text === "newchat" || text === "newchat⌘n";
-  }) || null;
+  const matches = candidates.filter((node) => {
+    return isNewChatTriggerElement(node);
+  });
+
+  return matches.find((node) => node.getBoundingClientRect().top > 4) || matches[0] || null;
+}
+
+function isNewChatTriggerElement(element) {
+  const node = element?.closest?.("button, [role='button'], a");
+  if (!(node instanceof HTMLElement)) return false;
+  if (!isVisibleElement(node)) return false;
+  if (node.closest("[data-codexpp-conversation-tabs='true']")) return false;
+  if (node.closest("[data-codexpp-conversation-tabs-menu='true']")) return false;
+  const label = normalizeIndicatorText(node.getAttribute("aria-label") || "");
+  const title = normalizeIndicatorText(node.getAttribute("title") || "");
+  const text = normalizeIndicatorText(node.textContent || "").replace(/\s+/g, "");
+  if (label === "new chat" || title === "new chat" || text === "newchat" || text === "newchat⌘n") {
+    return true;
+  }
+  return isIconOnlyNewChatButton(node, { label, title, text });
+}
+
+function isIconOnlyNewChatButton(node, normalized = {}) {
+  if (!(node instanceof HTMLElement)) return false;
+  if (normalized.label || normalized.title || normalized.text) return false;
+  if (node.tagName !== "BUTTON") return false;
+
+  const rect = node.getBoundingClientRect();
+  if (rect.top < -2 || rect.top > 56 || rect.width > 44 || rect.height > 44) return false;
+
+  const pathData = Array.from(node.querySelectorAll("svg path"))
+    .map((path) => path.getAttribute("d") || "")
+    .join(" ");
+  return pathData.includes("M2.6687 11.333")
+    && pathData.includes("V8.66699")
+    && pathData.includes("3.10425 4.85156");
 }
 
 function activateSidebarChatNode(node) {
@@ -2406,10 +2617,14 @@ function normalizeSidebarThreadId(value) {
 }
 
 function getCurrentChatId() {
-  return currentChatIdFromSidebarActive()
-    || chatIdFromPathname(window.location.pathname)
-    || chatIdFromHref(window.location.href)
+  return currentChatIdFromRoute()
+    || currentChatIdFromSidebarActive()
     || currentChatIdFromActiveLink();
+}
+
+function currentChatIdFromRoute() {
+  return chatIdFromPathname(window.location.pathname)
+    || chatIdFromHref(window.location.href);
 }
 
 function chatIdFromPathname(pathname) {
@@ -2427,8 +2642,6 @@ function currentChatIdFromActiveLink() {
     'a[aria-current="page"][href*="/local/"]',
     'a[data-state="active"][href*="/local/"]',
     'a[aria-selected="true"][href*="/local/"]',
-    'a[href*="/local/"][class*="bg-token-list-hover-background"]',
-    'a[href*="/local/"][class*="bg-token-foreground"]',
   ];
   for (const selector of selectors) {
     const anchor = document.querySelector(selector);
@@ -2438,6 +2651,49 @@ function currentChatIdFromActiveLink() {
     }
   }
   return null;
+}
+
+function currentChatIdFromHeaderTitle(state) {
+  const title = normalizeIndicatorText(currentNativeHeaderTitle(state));
+  if (!title) return null;
+
+  const items = [
+    ...state.openIds.map((id) => state.knownTabs[id]).filter(Boolean),
+    ...state.tabs,
+    ...Object.values(state.knownTabs || {}),
+  ];
+  const seen = new Set();
+  for (const item of items) {
+    if (!item?.id || seen.has(item.id)) continue;
+    seen.add(item.id);
+    if (normalizeIndicatorText(item.title) === title) return item.id;
+  }
+  return null;
+}
+
+function currentNativeHeaderTitle(state) {
+  const header = document.querySelector("header");
+  if (!(header instanceof HTMLElement)) return "";
+
+  const candidates = Array.from(header.querySelectorAll("span, div"))
+    .filter((node) => node instanceof HTMLElement)
+    .filter((node) => !state?.root?.contains(node))
+    .filter((node) => !node.closest("button, [role='button'], a"))
+    .map((node) => ({
+      node,
+      title: normalizeVisibleTitle(node.textContent),
+      rect: node.getBoundingClientRect(),
+    }))
+    .filter(({ title, rect }) =>
+      title &&
+      rect.width > 1 &&
+      rect.height > 1 &&
+      rect.width <= 520 &&
+      rect.height <= 40
+    )
+    .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height));
+
+  return candidates[0]?.title || "";
 }
 
 function currentChatIdFromSidebarActive() {
@@ -2592,7 +2848,15 @@ function installMainShortcutBridge(api) {
     const beforeInput = (event, input = {}) => {
       const index = mainTabShortcutIndex(input);
       const closeCurrent = mainCloseCurrentTabShortcut(input);
-      if ((index === null && !closeCurrent) || !isCodexAppWebContents(wc)) return;
+      const newChat = mainNewChatShortcut(input);
+      if ((index === null && !closeCurrent && !newChat) || !isCodexAppWebContents(wc)) return;
+
+      if (newChat) {
+        wc.executeJavaScript(dispatchNewChatIntentScript("keyboard"), true).catch((error) => {
+          api.log.warn("[conversation-tabs] new chat intent dispatch failed", error);
+        });
+        return;
+      }
 
       event.preventDefault();
       if (closeCurrent) {
@@ -2654,6 +2918,13 @@ function mainCloseCurrentTabShortcut(input = {}) {
   return String(input.key || "").toLowerCase() === "w" || input.code === "KeyW";
 }
 
+function mainNewChatShortcut(input = {}) {
+  if (input.type !== "keyDown" && input.type !== "rawKeyDown") return false;
+  if (!(input.meta || input.command) || input.control || input.alt || input.shift) return false;
+  if (input.isAutoRepeat) return false;
+  return String(input.key || "").toLowerCase() === "n" || input.code === "KeyN";
+}
+
 function isCodexAppWebContents(wc) {
   const url = wc.getURL?.() || "";
   return url.startsWith("app://") || url.includes("codex");
@@ -2667,6 +2938,19 @@ function dispatchCloseCurrentTabShortcutScript() {
       });
       window.dispatchEvent(event);
       return { handled: event.defaultPrevented };
+    })()
+  `;
+}
+
+function dispatchNewChatIntentScript(source) {
+  return `
+    (() => {
+      const event = new CustomEvent("codexpp-conversation-tab-new-chat-intent", {
+        detail: { source: ${JSON.stringify(source || "keyboard")} },
+        cancelable: false,
+      });
+      window.dispatchEvent(event);
+      return { handled: true };
     })()
   `;
 }
