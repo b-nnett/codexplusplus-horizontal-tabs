@@ -1,6 +1,8 @@
+![Codex Horizontal Tabs](./hi.png)
+
 # Codex Horizontal Tabs
 
-Stable horizontal chat tabs for Codex++.
+Stable horizontal chat tabs for [Codex++](https://github.com/b-nnett/codex-plusplus).
 
 This tweak adds a native-feeling tab strip across the top of the Codex chat surface. It keeps recently opened chats available as tabs, mirrors Codex's own tab styling, and stays focused on one job: fast horizontal navigation between chats.
 
@@ -23,7 +25,7 @@ Version `1.0.0` is intentionally scoped to the horizontal tab bar only. Split-vi
 
 ## Install
 
-Clone the tweak into your Codex++ tweaks folder:
+Clone the tweak into your [Codex++](https://github.com/b-nnett/codex-plusplus) tweaks folder:
 
 ```sh
 cd "$HOME/Library/Application Support/codex-plusplus/tweaks"
