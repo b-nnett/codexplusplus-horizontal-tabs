@@ -6,7 +6,7 @@ Horizontal chat tabs for [Codex++](https://github.com/b-nnett/codex-plusplus).
 
 This tweak adds a native-feeling tab strip across the top of the Codex chat surface. It keeps recently opened chats available as tabs, mirrors Codex's own tab styling, and stays focused on one job: fast horizontal navigation between chats.
 
-Version `1.0.0` is intentionally scoped to the horizontal tab bar only. Split-view work lives on the `split-view-added` branch.
+Version `1.0.1` is intentionally scoped to the horizontal tab bar only. Split-view work lives on the `split-view-added` branch.
 
 ## Features
 
