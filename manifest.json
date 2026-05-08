@@ -1,0 +1,16 @@
+{
+  "id": "co.bennett.codex-horizontal-tabs",
+  "name": "Codex Horizontal Tabs",
+  "version": "1.0.0",
+  "githubRepo": "b-nnett/codexplusplus-horizontal-tabs",
+  "description": "Adds a Chrome-like top tab bar for open Codex chats.",
+  "author": {
+    "name": "bennett",
+    "url": "https://github.com/b-nnett"
+  },
+  "homepage": "https://github.com/b-nnett/codexplusplus-horizontal-tabs",
+  "tags": ["ui", "tabs", "productivity"],
+  "scope": "both",
+  "main": "index.js",
+  "iconUrl": "https://b-nnett.github.io/codex-plusplus/store/icons/tabs.png"
+}
